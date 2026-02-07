@@ -13,11 +13,17 @@ from torch.nn import functional as f
 # this contains configs to setup our gpt-2
 @dataclass
 class GPTConfig:
-    block_size: int = 256
-    vocab_size: int = 65
-    n_layer: int = 6
-    n_head: int = 6
-    n_embd: int = 384
+    block_size: int = 1024 # max seq length 
+    vocab_size: int = 50257 # number of tokens: 50,000 merges + 256 bytes + 1 <|endoftext|> token
+    n_layer: int = 12  # number of layer
+    n_head: int = 12 # number of head
+    n_embd: int = 768 # embedding dimension
+    # # for mock testing
+    # block_size: int = 256
+    # vocab_size: int = 65
+    # n_layer: int = 6
+    # n_head: int = 6
+    # n_embd: int = 384
 
 
 # ----- CausalSelfAttention
@@ -157,3 +163,130 @@ class GPT(nn.Module):
             )
         )
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+    def forward(self, idx): 
+        # idx is of shape (B, T)
+        B, T = idx.size()
+        assert T <= self.config.block_size, (f"Cannot forward sequence of length {T}, block_size is {self.config.block_size}")
+        # forward the token and positional embeddings 
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+        pos_emb = self.transformer.wpe(pos) # postion embeddings of shape (T, n_embd)
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (B, T, n_embd)
+        x = tok_emb + pos_emb
+
+        # forward block of transformer
+        for block in self.transformer.h:
+            x = block(x)
+        
+        # forward the final layernorm and classifier
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x) # (B, T, vocab_size)
+        return logits
+
+    # The method is bound to the class, not to an instance
+    # The first argument is the class itself, conventionally named cls
+    # You can call it without creating an object first
+    # self = an already-created object, You can only call this after instantiating the class
+    # This pattern is called a factory method.
+    # @classmethod is used when a method needs access to the class itself (not an instance), typically to create and return a new object, which is why it takes cls instead of self.
+    @classmethod
+    def from_pretrained(cls, model_type):
+        """Loads pretrained GPT-2 model weights from hugging face"""
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        from transformers import GPT2LMHeadModel 
+        print("loading weights from pretrained gpt: %s" % modeltype)
+
+        # n_layer, n_head, n_embdd are determined from model_type
+        config_args = {
+            "gpt2": dict(n_layers=12, n_head=12, n_embd=768),  # 124M params
+            "gpt2-medium": dict(n_layers=24, n_head=16, n_embd=1024),  # 350M params
+            "gpt2-large": dict(n_layers=36, n_head=20, n_embd=1280),  # 774M params
+            "gpt2-xl": dict(n_layers=48, n_head=25, n_embd=1600),  # 1558M params
+        }[model_type]
+        config_args['vocab_size'] = 50257 # always 50257 for gpt2 models
+        config_args["block_size"] = 1024  # always 1024 for gpt2 models
+
+        # create a from scratch initialized minGPT model
+        # **config_args unpacks a dictionary into named arguments (key=value), while * unpacks a list/tuple into positional arguments.
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer
+
+        # initialized huggingface/transformer model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        # copy while ensuring all of the parameters are aligned and match the name and shapes
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore mask/bias
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith(".attn.bias")] # ignore mask/bias
+        # All of these were implemented as Conv1D in GPT-2.
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        # basically openai checkpoints uses a "Conv1D" module, but we want to use vanilla 
+        # this means that we have to transpose these weights when we import them 
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatch keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+
+        # GPT-2’s original Conv1D layers are actually linear layers with transposed weight storage, so when importing them into PyTorch nn.Linear, we must transpose those weights and verify the reversed shape matches exactly.
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # special treatment for the Conv1D weights we need to transpose
+                # What [::-1] does: It reverses the shape tuple.
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].t())
+                else:
+                    # vanilla copy over parameters 
+                    assert sd_hf[k].shape == sd[k].shape
+                    with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+        
+        return model
+
+# -----
+num_return_sequences = 5 
+max_length = 30
+
+model = GPT.from_pretrained("gpt2")
+print('Yay! no crash')
+model.eval()
+model.to('cuda')
+
+# prefix tokens 
+import tiktoken
+enc = tiktoken.get_encoding('gpt2')
+tokens = enc.encode("Hello, I'm a langauge model")
+tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
+tokens = token.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
+x = tokens.to('cuda')
+
+# generate! rightnow x is (B,T) where B = 5, T = 8
+# set seed to 42 
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+while x.size(1) < max_length:
+    # forward the model to get logits 
+    with torch.no_grad():
+        logits = model(x) # (B, T, vocab_size)
+        # take the logits at the last position 
+        logits = logits[:,-1,:] # (B, vocab_size)
+        # get the probabilities 
+        probs = f.softmax(logits, dim=-1) # (B, vocab_size)
+        # do top-k sampling of 50 (huggingface pipeline default)
+        # topk_probs here become (5,50), topk_indices is (5,50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token from top-k probabilities
+        # torch.multinomial(input, num_samples)
+        ix = torch.multinomial(topk_probs, 1) # (B,1)
+        # gather the corresponding indices
+        # torch.gather(input, dim, index)
+        xcol = torch.gather(topk_indices, -1, ix) # (B,1)
+        # append to sequence 
+        x = torch.cat((x, xcol), dim=1)
+
+# print generated text 
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
