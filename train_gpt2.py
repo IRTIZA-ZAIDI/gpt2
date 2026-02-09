@@ -337,6 +337,8 @@ class GPT(nn.Module):
 
 
 # -----
+import time 
+
 # auto-detect device
 device = "cpu"
 if torch.cuda.is_available():
@@ -352,7 +354,6 @@ if torch.cuda.is_available():
 
 # -----
 import tiktoken
-
 
 class DataLoaderLite:
     def __init__(self, B, T):
@@ -384,7 +385,26 @@ class DataLoaderLite:
 
 
 # -----
-train_loader = DataLoaderLite(4, 32)
+# keep decreasing batch size untill it fits the gpu
+# maximize batch-size on gpu and keep nice numbers like 2^n since they run well on gpus
+train_loader = DataLoaderLite(B=16, T=1024)
+
+# to enable TF32
+# remember tensorcores(optimized 4x4 matrix operations)
+# torch.set_float32_matul_precision('high')
+# high -> tf32
+# highest -> everything is in fp32
+# tf32 is a good approx of fp32 operations that deceases 23 to 10 in mantissa range but we dont notice the diff, as it is local to the operation
+# according to nvidia we should get 8x increase
+# but we get 3x because we are still memory-bound. (almost everything is still fp32)
+
+# datatypes
+# sign, exponents, and mantissa
+# exponent represents the range and mantissa represents the precision we can have
+# fp32(m23), tf32(m10) and bf16(m7) all have same exponent range (e8)
+# however fp16 have e5 and m10 so we cannot represent full range as fp32 and we have to use gradient scaling: GradScaler rescues tiny FP16 gradients from becoming zero by temporarily making them bigger.
+# https://docs.pytorch.org/tutorials/recipes/recipes/amp_recipe.html
+# Adding torch.autocast: read the above link and follow in optimization loop
 
 # get logits
 model = GPT(GPTConfig())
@@ -394,13 +414,27 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
 # optimize
 for i in range(2):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+        # this is mixed precision
+        # Autocast = BF16 compute + FP32 memory
+        # Autocast controls how operations are executed, not how parameters are stored.
+        # Model weights are still stored in FP32
+        # Activations/loss & matmuls are automatically cast to BF16
+        # Numerically sensitive ops (softmax, layernorm, loss) stay FP32
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+    torch.cuda.synchronize() # wait for gpu to finish work
+    t1 = time.time()
+    dt = (t1 - t0)*1000 # time difference in miliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    print(
+        f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, , tokens_per_sec: {tokens_per_sec:.2f}"
+    )
 
 import sys
 
