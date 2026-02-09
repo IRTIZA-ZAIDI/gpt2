@@ -7,7 +7,24 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 
+# nullcontext = “pretend there is a context manager, but don’t actually change anything.”
+# nullcontext() is a context manager that does nothing on enter and exit.
+# This avoids duplicating code.
+from contextlib import nullcontext
+
 # -----
+# FIXING UGLY NUMBERS
+# scan ur code to identify nice numbers(2^n) and ugly numbers
+# increase the number of ugly numbers to match nearest power of 2 so that gpu block tiling can be optimised
+# example we will override GPTConfig vocab_size to 50257 -> 50304
+# dt increases from 96ms to 93ms, even though we increased vocab_size that are never going to be used.
+# we introduced few useless tokens.(their probability in lm_head is forced to be 0)
+# -----
+
+# ADDING GPT-3 OPTIMIZATION PARAMTERS
+# gpt3 has almost same architecture but alot more training details
+# only difference is more data, longer context length, and larger model
+# so we can borrow optimization/parameters mentioned in gpt3 for gpt2 training
 
 
 # ----- GPTConfig
@@ -95,12 +112,36 @@ class CausalSelfAttention(nn.Module):
             1, 2
         )  # (B, nh, T, hs)
 
-        # attention (materializes the large (T, T) matrix for all the queries and keys)
-        # (B, nh) together form the batched dimensions for attention
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) = (B, nh, T, hs)
+        # -------
+        # FLASH ATTENTION
+        # -------
+        # Problems with naive attention:
+        # - Materializes the full (T, T) attention matrix
+        # - High HBM / VRAM reads & writes (memory-bound)
+        # - torch.compile cannot fuse these ops because FlashAttention
+        #   is not a simple kernel fusion but an algorithmic rewrite
+        #
+        # FlashAttention instead:
+        # - Computes attention in tiled blocks (no full (T, T) matrix)
+        # - Uses online softmax (numerically stable)
+        # - Fuses matmul + softmax + dropout + matmul into one kernel
+        # - Significantly reduces memory IO
+        #
+        # (B, nh) are treated as batch dimensions for attention
+        # -------
+        # NAIVE ATTENTION
+        # -------
+        # # attention (materializes the large (T, T) matrix for all the queries and keys)
+        # # (B, nh) together form the batched dimensions for attention
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+        # att = F.softmax(att, dim=-1)
+        # y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) = (B, nh, T, hs)
+        # -------
+        # FLASH ATTENTION
+        # -------
+        # compund operation
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
 
         # y = (B, nh, T, hs)
         # y.transpose(1,2) -> (B, nh, T, hs) -> (B, T, nh, hs)
@@ -131,7 +172,7 @@ class MLP(nn.Module):
         # helps to recover dead neuron due as it always contribute a gradient
         self.gelu = nn.GELU(approximate="tanh")
         self.c_proj = nn.Linear(config.n_embd * 4, config.n_embd)
-        # added flag to initialise weight scaling 
+        # added flag to initialise weight scaling
         self.c_proj.NANOGPT_SCALE_INIT = 1
 
     def forward(self, x):
@@ -193,7 +234,7 @@ class GPT(nn.Module):
         # makes both layers point to the same Parameter object.
         # Same tensor, just transposed by nn.Linear internally.
         # Shapes still work because embeddings use the matrix as (vocab, emb) via row lookup, while the output head uses the transpose (emb, vocab) in matrix multiplication — the same tensor, two valid orientations.
-        self.transformer.wte.weight = self.lm_head.weight 
+        self.transformer.wte.weight = self.lm_head.weight
 
         # init params
         # apply is a method of nn.Module
@@ -215,9 +256,9 @@ class GPT(nn.Module):
             # Uncontrolled residuals → exploding activations → unstable training
             # Because each Transformer block has two residual paths: Attention residual and MLP residual. So total residual variance grows with ~2L.
             # (2 * n_layer)^(-0.5) scales residual-producing weights so that, despite many residual additions, the overall activation variance stays stable instead of exploding as depth increases.
-            std = 0.02 
+            std = 0.02
             if hasattr(module, "NANOGPT_SCALE_INIT"):
-                std =  (2 * self.config.n_layer) ** -0.5
+                std = (2 * self.config.n_layer) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -272,14 +313,14 @@ class GPT(nn.Module):
         assert model_type in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
         from transformers import GPT2LMHeadModel
 
-        print("loading weights from pretrained gpt: %s" % modeltype)
+        print("loading weights from pretrained gpt: %s" % model_type)
 
         # n_layer, n_head, n_embdd are determined from model_type
         config_args = {
-            "gpt2": dict(n_layers=12, n_head=12, n_embd=768),  # 124M params
-            "gpt2-medium": dict(n_layers=24, n_head=16, n_embd=1024),  # 350M params
-            "gpt2-large": dict(n_layers=36, n_head=20, n_embd=1280),  # 774M params
-            "gpt2-xl": dict(n_layers=48, n_head=25, n_embd=1600),  # 1558M params
+            "gpt2": dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            "gpt2-medium": dict(n_layer=24, n_head=16, n_embd=1024),  # 350M params
+            "gpt2-large": dict(n_layer=36, n_head=20, n_embd=1280),  # 774M params
+            "gpt2-xl": dict(n_layer=48, n_head=25, n_embd=1600),  # 1558M params
         }[model_type]
         config_args["vocab_size"] = 50257  # always 50257 for gpt2 models
         config_args["block_size"] = 1024  # always 1024 for gpt2 models
@@ -337,7 +378,7 @@ class GPT(nn.Module):
 
 
 # -----
-import time 
+import time
 
 # auto-detect device
 device = "cpu"
@@ -350,17 +391,18 @@ print(f"using device: {device}")
 # -----
 torch.manual_seed(1337)
 if torch.cuda.is_available():
-    torch.cude.manual_seed(1337)
+    torch.cuda.manual_seed(1337)
 
 # -----
 import tiktoken
+
 
 class DataLoaderLite:
     def __init__(self, B, T):
         self.B = B
         self.T = T
 
-        with open("input.txt", "r") as f:
+        with open("input.txt", "r", encoding="utf-8") as f:
             text = f.read()
         enc = tiktoken.get_encoding("gpt2")
         tokens = enc.encode(text)
@@ -387,11 +429,11 @@ class DataLoaderLite:
 # -----
 # keep decreasing batch size untill it fits the gpu
 # maximize batch-size on gpu and keep nice numbers like 2^n since they run well on gpus
-train_loader = DataLoaderLite(B=16, T=1024)
+train_loader = DataLoaderLite(B=1, T=1024)
 
 # to enable TF32
 # remember tensorcores(optimized 4x4 matrix operations)
-# torch.set_float32_matul_precision('high')
+# torch.set_float32_matmul_precision('high')
 # high -> tf32
 # highest -> everything is in fp32
 # tf32 is a good approx of fp32 operations that deceases 23 to 10 in mantissa range but we dont notice the diff, as it is local to the operation
@@ -407,33 +449,79 @@ train_loader = DataLoaderLite(B=16, T=1024)
 # Adding torch.autocast: read the above link and follow in optimization loop
 
 # get logits
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device)
+# https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html
+# Speedup mainly comes from reducing Python overhead and GPU read/writes
+# approx 2.3 x faster training
+# unlike python interpreter code it doesnt run one by one on module, it optimizes the object
+# kernel fusion -> many operations done together
+if device == "cuda":
+    model = torch.compile(model)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+
+# -----
+# learning rate schedule
+# learning rate with cosine decay
+max_lr = 6e-4
+min_lr = max_lr * 0.1 
+warmup_steps = 10
+max_steps = 50
+# gpt3 decay time is less than max-steps time
+# they trained 10% of max-steps without decay which we wont be doing
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps: 
+        return max_lr * (it + 1) / warmup_steps
+    # 2) if it > lr_decay_iters, return min learning rate
+    if it < warmup_steps: 
+        return min_lr
+    # 3) in between, use cosine decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1 
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    return min_lr + coeff * (max_lr - min_lr)
 
 # optimize
-for i in range(2):
+for step in range(max_steps):
     t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16):
+    if device == "cuda":
+        ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
         # this is mixed precision
         # Autocast = BF16 compute + FP32 memory
         # Autocast controls how operations are executed, not how parameters are stored.
         # Model weights are still stored in FP32
         # Activations/loss & matmuls are automatically cast to BF16
         # Numerically sensitive ops (softmax, layernorm, loss) stay FP32
+    else:
+        # either disable autocast or use CPU autocast only if you know you want it
+        ctx = (
+            torch.autocast(device_type="cpu", dtype=torch.bfloat16)
+            if device == "cpu"
+            else nullcontext()
+        )
+
+    with ctx:
         logits, loss = model(x, y)
     loss.backward()
+    # clipping gradients: avoid getting to big a shock on bad batch(tolerate bad gradients)
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    # determine and set lr for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
-    torch.cuda.synchronize() # wait for gpu to finish work
+    if device == "cuda":
+        torch.cuda.synchronize()  # wait for gpu to finish work
     t1 = time.time()
-    dt = (t1 - t0)*1000 # time difference in miliseconds
+    dt = (t1 - t0) * 1000  # time difference in miliseconds
     tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
     print(
-        f"step {i}, loss: {loss.item()}, dt: {dt:.2f}ms, , tokens_per_sec: {tokens_per_sec:.2f}"
+        f"step {step} | lr: {lr} | loss: {loss.item()} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens_per_sec: {tokens_per_sec:.2f}"
     )
 
 import sys
