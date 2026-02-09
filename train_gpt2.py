@@ -266,7 +266,7 @@ class GPT(nn.Module):
             # (2 * n_layer)^(-0.5) scales residual-producing weights so that, despite many residual additions, the overall activation variance stays stable instead of exploding as depth increases.
             std = 0.02
             if hasattr(module, "NANOGPT_SCALE_INIT"):
-                std = (2 * self.config.n_layer) ** -0.5
+                std *= (2 * self.config.n_layer) ** -0.5
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -478,9 +478,28 @@ class DataLoaderLite:
 
 
 # -----
+# GRADIENT ACCUMULATION
+# Gradient accumulation lets you train as if you had a large batch size, even when your GPU can only fit a small batch, by splitting one big update into multiple small ones.
+# Gradient accumulation fakes a big batch by summing gradients from many small batches before updating once.
+# -----
+# total batch size measured in number of tokens
+# 524288 = 2**19 ≈ 0.5M tokens
+total_batch_size = 524288
+# now this B is just performance optimzation setting to maximize gpu usage
+B = 16  # micro-batch size (number of sequences per step)
+T = 1024  # sequence length (tokens per sequence
+# ensure total batch size is divisible by micro-batch tokens
+assert (total_batch_size % (B * T) == 0), "make sure total_batch_size is divisible by B * T"
+# number of gradient accumulation steps needed
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+# -----
+# DATALOADER
 # keep decreasing batch size untill it fits the gpu
 # maximize batch-size on gpu and keep nice numbers like 2^n since they run well on gpus
-train_loader = DataLoaderLite(B=1, T=1024)
+train_loader = DataLoaderLite(B=B, T=T)
 
 # to enable TF32
 # remember tensorcores(optimized 4x4 matrix operations)
@@ -532,7 +551,7 @@ def get_lr(it):
     if it < warmup_steps:
         return max_lr * (it + 1) / warmup_steps
     # 2) if it > lr_decay_iters, return min learning rate
-    if it < warmup_steps:
+    if it >= max_steps:
         return min_lr
     # 3) in between, use cosine decay down to min learning rate
     decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
@@ -546,28 +565,35 @@ def get_lr(it):
 # optimize
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
-    if device == "cuda":
-        ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        # this is mixed precision
-        # Autocast = BF16 compute + FP32 memory
-        # Autocast controls how operations are executed, not how parameters are stored.
-        # Model weights are still stored in FP32
-        # Activations/loss & matmuls are automatically cast to BF16
-        # Numerically sensitive ops (softmax, layernorm, loss) stay FP32
-    else:
-        # either disable autocast or use CPU autocast only if you know you want it
-        ctx = (
-            torch.autocast(device_type="cpu", dtype=torch.bfloat16)
-            if device == "cpu"
-            else nullcontext()
-        )
 
-    with ctx:
-        logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    # gradient-accumulation over all micro_step batches
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+
+        if device == "cuda":
+            ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            # this is mixed precision
+            # Autocast = BF16 compute + FP32 memory
+            # Autocast controls how operations are executed, not how parameters are stored.
+            # Model weights are still stored in FP32
+            # Activations/loss & matmuls are automatically cast to BF16
+            # Numerically sensitive ops (softmax, layernorm, loss) stay FP32
+        else:
+            # either disable autocast or use CPU autocast only if you know you want it
+            ctx = (torch.autocast(device_type="cpu", dtype=torch.bfloat16) if device == "cpu" else nullcontext())
+
+        with ctx:
+            logits, loss = model(x, y)
+
+        # Dividing the loss by grad_accum_steps makes gradient accumulation mathematically equivalent to a true larger batch.
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        # Loss/grads always have += so they will accumulate
+        loss.backward()
+
     # clipping gradients: avoid getting to big a shock on bad batch(tolerate bad gradients)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     # determine and set lr for this iteration
@@ -578,10 +604,14 @@ for step in range(max_steps):
     if device == "cuda":
         torch.cuda.synchronize()  # wait for gpu to finish work
     t1 = time.time()
-    dt = (t1 - t0) * 1000  # time difference in miliseconds
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    dt = (t1 - t0) * 1000 # time difference in miliseconds
+
+    # tokens stats
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_sec = tokens_processed / dt
+
     print(
-        f"step {step} | lr: {lr} | loss: {loss.item()} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens_per_sec: {tokens_per_sec:.2f}"
+        f"step {step} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt:.2f}ms | tokens_per_sec: {tokens_per_sec:.2f}"
     )
 
 import sys
