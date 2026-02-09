@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import inspect
 
 # nullcontext = “pretend there is a context manager, but don’t actually change anything.”
 # nullcontext() is a context manager that does nothing on enter and exit.
@@ -21,10 +22,17 @@ from contextlib import nullcontext
 # we introduced few useless tokens.(their probability in lm_head is forced to be 0)
 # -----
 
+# -----
 # ADDING GPT-3 OPTIMIZATION PARAMTERS
 # gpt3 has almost same architecture but alot more training details
 # only difference is more data, longer context length, and larger model
 # so we can borrow optimization/parameters mentioned in gpt3 for gpt2 training
+# -----
+# GPT-3 GRADUAL BATCH SIZE INCREASE
+# we skip this part to keep math clean
+# -----
+# DATA BACH ARE USEDWITHOUT REPLACEMENT FOR EACH EPOCH
+# we did this as we are moving a window over out batch
 
 
 # ----- GPTConfig
@@ -376,8 +384,51 @@ class GPT(nn.Module):
 
         return model
 
+    # Configure AdamW optimizer with correct weight decay handling.
+    # apply decay only to true weight matrices (Linear/Embedding),
+    # exclude biases and LayerNorm params for stability, and
+    # automatically enable fused AdamW on CUDA for faster training.
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # start with all of the candidate parameters (that require grad)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
 
-# -----
+        # create optim groups.
+        # any parameter that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ]
+
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+
+        print(
+            f"num decayed parameter tensors: {len(decay_params)}, "
+            f"with {num_decay_params:,} parameters"
+        )
+        print(
+            f"num non-decayed parameter tensors: {len(nodecay_params)}, "
+            f"with {num_nodecay_params:,} parameters"
+        )
+
+        # Create AdamW optimizer and use the fused version if it is available
+        fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and "cuda" in device
+        print(f"using fused AdamW: {use_fused}")
+
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused
+        )
+
+        return optimizer
+
+
+# -----------------------------------------------
 import time
 
 # auto-detect device
@@ -459,29 +510,38 @@ model.to(device)
 if device == "cuda":
     model = torch.compile(model)
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+# -----
+# optimizer
+optimizer = model.configure_optimizers(
+    weight_decay=0.1, learning_rate=6e-4, device=device
+)
 
 # -----
 # learning rate schedule
 # learning rate with cosine decay
 max_lr = 6e-4
-min_lr = max_lr * 0.1 
+min_lr = max_lr * 0.1
 warmup_steps = 10
 max_steps = 50
+
+
 # gpt3 decay time is less than max-steps time
 # they trained 10% of max-steps without decay which we wont be doing
 def get_lr(it):
     # 1) linear warmup for warmup_iters steps
-    if it < warmup_steps: 
+    if it < warmup_steps:
         return max_lr * (it + 1) / warmup_steps
     # 2) if it > lr_decay_iters, return min learning rate
-    if it < warmup_steps: 
+    if it < warmup_steps:
         return min_lr
     # 3) in between, use cosine decay down to min learning rate
     decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1 
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (
+        1.0 + math.cos(math.pi * decay_ratio)
+    )  # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
+
 
 # optimize
 for step in range(max_steps):
@@ -513,7 +573,7 @@ for step in range(max_steps):
     # determine and set lr for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+        param_group["lr"] = lr
     optimizer.step()
     if device == "cuda":
         torch.cuda.synchronize()  # wait for gpu to finish work
