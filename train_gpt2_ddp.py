@@ -482,6 +482,43 @@ class DataLoaderLite:
         return x, y
 
 # -----------------------------------------------------------------------------
+# helper function for HellaSwag eval
+# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
+
+# More precisely:
+# 1. **Run model once** on each of the 4 sequences (prompt+completion) → `logits` for **every position**.
+# 2. **Shift** so position `t` logits are compared to the **next token** `t+1` (standard next-token LM loss).
+# 3. **Cross-entropy per token** (no averaging yet) → loss for each predicted next token.
+# 4. **Apply the mask** (shifted) so **prompt losses become 0 / ignored**, and only completion-token losses remain.
+# 5. **Average loss over completion tokens** for each of the 4 rows.
+# 6. **Pick the minimum average loss** → that row’s completion is the model’s most likely.
+
+
+def get_most_likely_row(tokens, mask, logits):
+    # evaluate the autoregressive loss at all positions
+    shift_logits = (logits[..., :-1, :]).contiguous()
+    shift_tokens = (tokens[..., 1:]).contiguous()
+    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+    flat_shift_tokens = shift_tokens.view(-1)
+    shift_losses = F.cross_entropy(
+        flat_shift_logits, flat_shift_tokens, reduction="none"
+    )
+    shift_losses = shift_losses.view(tokens.size(0), -1)
+    # now get the average loss just for the completion region (where mask == 1), in each row
+    shift_mask = (
+        mask[..., 1:]
+    ).contiguous()  # we must shift mask, so we start at the last prompt token
+    masked_shift_losses = shift_losses * shift_mask
+    # sum and divide by the number of 1s in the mask
+    sum_loss = masked_shift_losses.sum(dim=1)
+    avg_loss = sum_loss / shift_mask.sum(dim=1)
+    # now we have a loss for each of the 4 completions
+    # the one with the lowest loss should be the most likely
+    pred_norm = avg_loss.argmin().item()
+    return pred_norm
+
+
+# -----------------------------------------------------------------------------
 # simple launch:
 # python train_gpt2.py
 # DDP launch for e.g. 8 GPUs:
@@ -553,7 +590,7 @@ model = GPT(GPTConfig(vocab_size=50304))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
 use_compile = (
-    False  # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+    False  # torch.compile interferes with HellaSwag eval and Generation.
 )
 if use_compile:
     model = torch.compile(model)
